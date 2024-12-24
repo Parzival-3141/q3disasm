@@ -2,6 +2,7 @@
 Disassembles a QVM file to stdout for funsies.
 
 ## Building
+Requires [zig 0.13.0](https://ziglang.org/download/).
 ```sh
 zig build-exe q3disasm.zig
 ./q3disasm -help
