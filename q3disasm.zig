@@ -6,7 +6,7 @@ const usage =
     \\Disassembles a QVM file to stdout.
     \\
     \\Options:
-    \\    -map <file>    Path to a .map file containing symbol info. If unspecified it'll look for one with the same name and directory as the input QVM file.
+    \\    -map <file>    Path to a .map file containing symbol info. If unspecified it'll try to find one with the same name and directory as the input QVM file.
     \\    -no-syms       Don't print symbol info with disassembly.
     \\    -header        Print the QVM header before disassembly.
     \\    -h|help        Print this help text and exit.
@@ -21,7 +21,9 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(arena);
     _ = args.skip();
 
-    const stdout = std.io.getStdOut().writer();
+    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+    const stdout = bw.writer();
+    defer bw.flush() catch |err| std.log.err("unable to flush to stdout: {s}", .{@errorName(err)});
 
     var qvm_path: ?[]const u8 = null;
     var map_path: ?[]const u8 = null;
@@ -114,44 +116,119 @@ pub fn main() !void {
 
     const code_seg = qvm[@intCast(header.code_offset)..][0..@intCast(header.code_length)];
 
-    var ip: usize = 0; // index into the code segment
-    var instruction: usize = 0; // counts which instruction we're on
+    var ip: u32 = 0; // index into the code segment
+    var instruction: u32 = 0; // counts which instruction we're on
+    var current_proc: ?*const Symbol = null; // track which procedure we're on (Unused when symbols == null)
+    defer std.debug.assert((symbols == null) == (current_proc == null));
 
     while (ip < code_seg.len) : (instruction += 1) {
-        if (symbols) |_symbols| for (_symbols) |sym| {
+        if (symbols) |_symbols| for (_symbols) |*sym| {
             if (sym.segment != .code) break; // map entries are sorted by segment and the code segment is always first.
             if (sym.offset == instruction) {
-                try stdout.print("\n{s}:\n", .{sym.name});
+                current_proc = sym;
+                try stdout.print("\n{s}():\n", .{sym.name});
             }
         };
 
+        try stdout.print("{X:0>8}", .{instruction});
+
         const op: Opcode = @enumFromInt(code_seg[ip]);
-        try stdout.print("    {s}", .{@tagName(op)});
+        try stdout.print(" {s: >10}", .{@tagName(op)});
         ip += 1;
 
         const arg_size = op.argumentSize();
         if (arg_size > 0) {
-            // const arg_bytes = code_seg[ip..][0..arg_size];
-            try stdout.print(" {d}", .{switch (arg_size) {
+            const arg: i32 = switch (arg_size) {
                 1 => code_seg[ip],
-                4 => std.mem.bytesToValue(i32, code_seg[ip..][0..4]),
+                // multi-byte arguments are little endian
+                4 => std.mem.littleToNative(i32, std.mem.bytesToValue(i32, code_seg[ip..][0..4])),
                 else => unreachable,
-            }});
+            };
             ip += arg_size;
+            try stdout.print(" 0x{X: <8}", .{@as(u32, @bitCast(arg))});
+
+            // print extra information about the argument if symbols are available
+            if (symbols) |_symbols| switch (op) {
+                .CONST => {
+                    switch (@as(Opcode, @enumFromInt(code_seg[ip]))) {
+                        .CALL => {
+                            for (_symbols) |sym| {
+                                if (sym.segment == .code and sym.offset == @as(u32, @bitCast(arg))) {
+                                    try stdout.print(" ; {s}()", .{sym.name});
+                                }
+                            }
+                        },
+                        .LOAD1, .LOAD2, .LOAD4 => {
+                            for (_symbols, 0..) |sym, i| {
+                                // LIT and BSS symbol offsets are encoded relative to the DATA segment in the instruction stream.
+                                // However, the .map file encodes them relative to their respective segments, so we need to apply
+                                // offsets before comparing to the LOAD address argument.
+                                const seg_offset: u32 = switch (sym.segment) {
+                                    .code => continue,
+                                    .data => 0,
+                                    .lit => @intCast(header.data_length),
+                                    .bss => @intCast(header.data_length + header.lit_length),
+                                };
+                                const sym_offset = sym.offset + seg_offset;
+
+                                const arg_u: u32 = @bitCast(arg);
+                                if (sym_offset == arg_u) {
+                                    try stdout.print(" ; {s}", .{sym.name});
+                                    break;
+                                }
+
+                                // check if arg is an offset into the symbol
+                                if (sym_offset < arg_u) {
+                                    // check the next symbol in the segment.
+                                    if (i + 1 < _symbols.len) {
+                                        const next = _symbols[i + 1];
+                                        if (next.segment != sym.segment) continue;
+                                        if (next.offset <= sym.offset) continue; // q3asm.c:HackToSegment() can cause symbol offsets to become non-contiguous
+                                        if (arg_u >= next.offset + seg_offset) continue;
+                                    } else continue; // if there isn't one we assume arg's not an offset
+
+                                    try stdout.print(" ; {s}+0x{X}", .{ sym.name, arg_u - sym_offset });
+                                    break;
+                                }
+                            }
+                        },
+                        .JUMP => try printJumpInfoComment(stdout, @bitCast(arg), current_proc.?),
+                        else => {},
+                    }
+                },
+                .EQ,
+                .NE,
+                .LTI,
+                .LEI,
+                .GTI,
+                .GEI,
+                .LTU,
+                .LEU,
+                .GTU,
+                .GEU,
+                .EQF,
+                .NEF,
+                .LTF,
+                .LEF,
+                .GTF,
+                .GEF,
+                => try printJumpInfoComment(stdout, @bitCast(arg), current_proc.?),
+                else => {},
+            };
         }
 
-        try stdout.print("\n", .{});
+        try stdout.writeByte('\n');
     }
 }
 
 const Segment = enum(u8) {
-    code,
+    code = 0,
     /// initialized 32 bit data, will be byte swapped
-    data,
+    data = 1,
     /// strings
-    lit,
+    lit = 2,
     /// 0 filled
-    bss,
+    bss = 3,
 };
 
 const Symbol = struct {
@@ -248,7 +325,9 @@ const Opcode = enum(u8) {
     PUSH,
     POP,
 
+    /// Followed by an i32 constant
     CONST,
+    /// Followed by an i32 offset from the stack register
     LOCAL,
 
     JUMP,
@@ -322,6 +401,9 @@ const Opcode = enum(u8) {
     CVIF,
     CVFI,
 
+    /// Returns the size of the opcode's argument in bytes.
+    /// Returns 0 if the opcode has no argument.
+    /// Multi-byte arguments are encoded as little endian.
     fn argumentSize(op: Opcode) u8 {
         return switch (op) {
             .ENTER,
@@ -329,7 +411,6 @@ const Opcode = enum(u8) {
             .LOCAL,
             .LEAVE,
 
-            // these opcodes have indirect arguments (value = [arg])
             .EQ,
             .NE,
             .LTI,
@@ -355,3 +436,9 @@ const Opcode = enum(u8) {
         };
     }
 };
+
+fn printJumpInfoComment(writer: anytype, jmp_target_instr: u32, procedure: *const Symbol) !void {
+    // based off instruction count, not byte offset!
+    const proc_rel_jmp_offset = jmp_target_instr - procedure.offset;
+    try writer.print(" ; {s}()+0x{X} ({X:0>8})", .{ procedure.name, proc_rel_jmp_offset, jmp_target_instr });
+}
